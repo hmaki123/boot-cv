@@ -6,6 +6,9 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
     # بيسمحلك تشغله يدوياً من GitHub UI
+  repository_dispatch:
+    # بيسمح بتشغيله من التيليجرام أو أي Webhook خارجي فوراً
+    types: [telegram_search, search]
 
 jobs:
   hunt-jobs:
