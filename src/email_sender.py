@@ -1,9 +1,11 @@
 """
 email_sender.py - بيبعت إيميل احترافي مع الـ CV
 """
+import re
 import smtplib
 import logging
 import os
+import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.text      import MIMEText
 from email.mime.base      import MIMEBase
@@ -15,6 +17,11 @@ from src.config import (
 )
 
 log = logging.getLogger(__name__)
+
+HEADERS_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def build_cover_letter(job: dict, language: str = "en") -> str:
@@ -77,12 +84,51 @@ def detect_language(job: dict) -> str:
 
 def get_recipient_email(job: dict) -> str | None:
     """
-    بيحاول يجيب إيميل التواصل من الشغلانة
-    لو مش لاقي، بيرجع None وبيسكيب الشغلانة دي
+    بيحاول يجيب إيميل التواصل بطريقتين:
+    1. لو الشغلانة نفسها فيها contact_email بياخده مباشرة
+    2. بيزور صفحة الشغلانة ويجيب الإيميل بالـ regex
     """
-    # في المستقبل ممكن نعمل سكراب للصفحة الأصلية ونجيب الإيميل
-    # دلوقتي هنرجع None والـ main.py هيقدر يتعامل معاها
-    return job.get("contact_email")
+    # أولاً: إيميل مباشر في بيانات الشغلانة
+    if job.get("contact_email"):
+        return job.get("contact_email")
+
+    # ثانياً: زور صفحة الشغلانة وجيب الإيميل منها
+    url = job.get("url", "")
+    if not url or "linkedin.com" in url:
+        # LinkedIn بيحجب الـ scrapers — مفيش فايدة
+        return None
+
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": HEADERS_UA},
+            timeout=12,
+        )
+        if resp.status_code != 200:
+            return None
+
+        # جيب كل الإيميلات في الصفحة بالـ regex
+        email_pattern = r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
+        emails_found = re.findall(email_pattern, resp.text)
+
+        # فلتر الإيميلات المزعجة أو الغير مفيدة
+        blacklist_keywords = [
+            "noreply", "no-reply", "donotreply", "notifications",
+            "mailer", "support@linkedin", "jobs@linkedin",
+            "info@indeed", "noreply@indeed", "privacy@",
+            "legal@", "abuse@", "security@",
+        ]
+
+        for email in emails_found:
+            if not any(bl in email.lower() for bl in blacklist_keywords):
+                log.info(f"   📧 لقينا إيميل تواصل: {email}")
+                return email
+
+        log.debug(f"   ℹ️  مش لاقي إيميل في: {url[:60]}")
+    except Exception as e:
+        log.debug(f"   ℹ️  فشل جيب الإيميل من {url[:60]}: {e}")
+
+    return None
 
 
 def send_application(job: dict, recipient_email: str) -> bool:

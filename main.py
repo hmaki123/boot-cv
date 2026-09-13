@@ -13,6 +13,8 @@ from src.telegram_notify import (
 )
 import os
 
+os.makedirs("data", exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",

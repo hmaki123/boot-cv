@@ -21,6 +21,10 @@ def send_telegram(message: str) -> bool:
             "parse_mode": "Markdown",
         }
         resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            # لو فشل بسبب Markdown غير متوافق نبعتها كـ plain text
+            payload.pop("parse_mode", None)
+            resp = requests.post(url, json=payload, timeout=10)
         resp.raise_for_status()
         return True
     except Exception as e:

@@ -30,9 +30,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data/jobs_seen.db
-          key: jobs-db-${{ runner.os }}
+          key: jobs-db-${{ runner.os }}-${{ github.run_number }}
           restore-keys: |
-            jobs-db-
+            jobs-db-${{ runner.os }}-
 
       - name: 🔧 Create directories
         run: |

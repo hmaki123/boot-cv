@@ -3,11 +3,14 @@ scraper.py - بيسكان مواقع الشغل العربية ويجيب الش
 """
 import hashlib
 import time
+import random
+import re
 import urllib.parse
 import logging
 import requests
+from xml.etree import ElementTree as ET
 from bs4 import BeautifulSoup
-from src.config import SEARCH_KEYWORDS, ARAB_COUNTRIES, ARAB_COUNTRY_CODES
+from src.config import SEARCH_KEYWORDS, ARAB_COUNTRIES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -17,8 +20,38 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+
+def safe_request(url: str, retries: int = 3, timeout: int = 15) -> requests.Response | None:
+    """بيعمل HTTP request مع retry تلقائي في حالة الفشل"""
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            if resp.status_code == 200:
+                return resp
+            elif resp.status_code == 429:
+                wait = (attempt + 1) * 15
+                log.warning(f"⏳ Rate limited، هستنى {wait}s ثم أحاول تاني...")
+                time.sleep(wait)
+            elif resp.status_code in (403, 401):
+                log.warning(f"🚫 ممنوع الوصول ({resp.status_code}): {url[:60]}")
+                return None
+            else:
+                log.warning(f"HTTP {resp.status_code}: {url[:60]}")
+                return None
+        except requests.exceptions.Timeout:
+            log.warning(f"⌛ Timeout (محاولة {attempt + 1}/3): {url[:60]}")
+        except Exception as e:
+            log.warning(f"❌ Request error (محاولة {attempt + 1}/3): {e}")
+
+        if attempt < retries - 1:
+            time.sleep(random.uniform(2, 5))
+
+    return None
 
 
 def make_job_id(title: str, company: str, url: str) -> str:
@@ -40,54 +73,96 @@ def is_arab_location(location: str) -> bool:
     for country in ARAB_COUNTRIES:
         if country.lower() in loc:
             return True
-    return True  # لو الموقع عربي أصلاً نفترض إنه عربي
+    return False  # FIXED: كانت return True بالغلط — كانت بتعدّي كل شغلانة حتى لو مش عربية
 
 
 # ─────────────────────────────────────────────
-# 1. GOOGLE JOBS (أهم مصدر - بيجمع من كل المواقع)
+# 1. INDEED RSS (الأكثر ثبات — بيشتغل بدون JS)
 # ─────────────────────────────────────────────
-def scrape_google_jobs() -> list:
+def scrape_indeed_rss() -> list:
+    """بيسكان Indeed عبر RSS Feed — أثبت بكتير من HTML scraping ومش محتاج JavaScript"""
     jobs = []
-    log.info("🔍 بيسكان Google Jobs...")
+    log.info("🔍 بيسكان Indeed RSS...")
 
-    for keyword in ["planetarium operator arab", "قبة فلكية وظيفة", "dome operator middle east"]:
-        try:
-            query = urllib.parse.quote(keyword)
-            url = f"https://www.google.com/search?q={query}&ibp=htl;jobs"
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            soup = BeautifulSoup(resp.text, "html.parser")
+    indeed_domains = [
+        ("https://sa.indeed.com", "Saudi Arabia"),
+        ("https://ae.indeed.com", "UAE"),
+        ("https://eg.indeed.com", "Egypt"),
+        ("https://kw.indeed.com", "Kuwait"),
+        ("https://qa.indeed.com", "Qatar"),
+    ]
+    keywords = ["planetarium", "dome operator", "قبة فلكية", "fulldome"]
 
-            # بيجيب بطاقات الشغل من Google
-            cards = soup.find_all("div", class_=lambda c: c and "iFjolb" in c)
-            for card in cards:
-                try:
-                    title_el   = card.find("div", class_="BjJfJf")
-                    company_el = card.find("div", class_="vNEEBe")
-                    loc_el     = card.find("div", class_="Qk80Jf")
-
-                    title   = title_el.get_text(strip=True)   if title_el   else ""
-                    company = company_el.get_text(strip=True) if company_el else ""
-                    location = loc_el.get_text(strip=True)   if loc_el     else ""
-
-                    if not is_relevant(title):
-                        continue
-
-                    job = {
-                        "id":       make_job_id(title, company, url),
-                        "title":    title,
-                        "company":  company,
-                        "location": location,
-                        "url":      url,
-                        "source":   "Google Jobs",
-                    }
-                    jobs.append(job)
-                    log.info(f"  ✅ لقينا: {title} @ {company} - {location}")
-                except Exception:
+    for domain, country in indeed_domains:
+        for keyword in keywords:
+            try:
+                encoded = urllib.parse.quote(keyword)
+                url = f"{domain}/rss?q={encoded}&sort=date"
+                resp = safe_request(url, timeout=20)
+                if not resp:
                     continue
 
-            time.sleep(3)
-        except Exception as e:
-            log.warning(f"Google Jobs error: {e}")
+                # حاول parse الـ XML
+                try:
+                    root = ET.fromstring(resp.content)
+                    channel = root.find("channel")
+                    items = channel.findall("item") if channel else []
+                except ET.ParseError:
+                    # Fallback: BeautifulSoup لـ XML التالف
+                    soup = BeautifulSoup(resp.text, "xml")
+                    items_bs = soup.find_all("item")
+                    for item in items_bs:
+                        try:
+                            title = item.find("title").get_text(strip=True) if item.find("title") else ""
+                            link  = item.find("link").get_text(strip=True)  if item.find("link")  else ""
+                            desc  = item.find("description").get_text(strip=True) if item.find("description") else ""
+                            if not is_relevant(title, desc):
+                                continue
+                            jobs.append({
+                                "id":       make_job_id(title, "", link),
+                                "title":    title,
+                                "company":  "",
+                                "location": country,
+                                "url":      link,
+                                "source":   f"Indeed RSS ({country})",
+                            })
+                            log.info(f"  ✅ {title} - {country}")
+                        except Exception:
+                            continue
+                    time.sleep(random.uniform(1, 3))
+                    continue
+
+                for item in items:
+                    try:
+                        title   = (item.findtext("title")       or "").strip()
+                        link    = (item.findtext("link")        or "").strip()
+                        desc    = (item.findtext("description") or "").strip()
+                        company = ""
+
+                        # Indeed بيحط اسم الشركة جوه description بـ <b>
+                        company_match = re.search(r"<b>([^<]+)</b>", desc)
+                        if company_match:
+                            company = company_match.group(1).strip()
+
+                        if not is_relevant(title, desc):
+                            continue
+
+                        jobs.append({
+                            "id":       make_job_id(title, company, link),
+                            "title":    title,
+                            "company":  company,
+                            "location": country,
+                            "url":      link,
+                            "source":   f"Indeed RSS ({country})",
+                        })
+                        log.info(f"  ✅ {title} @ {company} - {country}")
+                    except Exception:
+                        continue
+
+                time.sleep(random.uniform(1, 3))
+
+            except Exception as e:
+                log.warning(f"Indeed RSS error '{keyword}' in {country}: {e}")
 
     return jobs
 
@@ -104,41 +179,42 @@ def scrape_bayt() -> list:
         try:
             encoded = urllib.parse.quote(term)
             url = f"https://www.bayt.com/en/international/jobs/{encoded}-jobs/"
-            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp = safe_request(url)
+            if not resp:
+                continue
             soup = BeautifulSoup(resp.text, "html.parser")
 
             listings = soup.find_all("li", {"data-js-job": True})
             for item in listings:
                 try:
                     title_el   = item.find("h2", class_="m0 t-regular")
-                    company_el = item.find("b", {"data-automation": "jobCompany"})
+                    company_el = item.find("b",    {"data-automation": "jobCompany"})
                     loc_el     = item.find("span", {"data-automation": "jobCity"})
                     link_el    = item.find("a", href=True)
 
-                    title   = title_el.get_text(strip=True)   if title_el   else ""
-                    company = company_el.get_text(strip=True) if company_el else ""
-                    location = loc_el.get_text(strip=True)   if loc_el     else ""
-                    link    = f"https://www.bayt.com{link_el['href']}" if link_el else url
+                    title    = title_el.get_text(strip=True)   if title_el   else ""
+                    company  = company_el.get_text(strip=True) if company_el else ""
+                    location = loc_el.get_text(strip=True)     if loc_el     else ""
+                    link     = f"https://www.bayt.com{link_el['href']}" if link_el else url
 
                     if not is_relevant(title):
                         continue
                     if not is_arab_location(location):
                         continue
 
-                    job = {
+                    jobs.append({
                         "id":       make_job_id(title, company, link),
                         "title":    title,
                         "company":  company,
                         "location": location,
                         "url":      link,
                         "source":   "Bayt.com",
-                    }
-                    jobs.append(job)
-                    log.info(f"  ✅ لقينا: {title} @ {company} - {location}")
+                    })
+                    log.info(f"  ✅ {title} @ {company} - {location}")
                 except Exception:
                     continue
 
-            time.sleep(2)
+            time.sleep(random.uniform(1, 3))
         except Exception as e:
             log.warning(f"Bayt error for '{term}': {e}")
 
@@ -157,39 +233,58 @@ def scrape_wuzzuf() -> list:
         try:
             encoded = urllib.parse.quote(term)
             url = f"https://wuzzuf.net/search/jobs/?q={encoded}"
-            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp = safe_request(url)
+            if not resp:
+                continue
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            cards = soup.find_all("div", class_="css-1gatmva")
+            # Fallback selectors — Wuzzuf بتغير CSS classes باستمرار
+            cards = (
+                soup.find_all("div", class_="css-1gatmva")
+                or soup.find_all("article", attrs={"data-wuzzuf-job": True})
+                or soup.find_all("div", class_=lambda c: c and "JobCard" in (c or ""))
+                or soup.find_all("div", attrs={"data-id": True})
+            )
+
             for card in cards:
                 try:
-                    title_el   = card.find("h2", class_="css-m604qf")
-                    company_el = card.find("a", class_="css-17s97q8")
-                    loc_el     = card.find("span", class_="css-5wys0k")
-                    link_el    = title_el.find("a", href=True) if title_el else None
+                    title_el = (
+                        card.find("h2", class_="css-m604qf")
+                        or card.find("h2", class_=lambda c: "title" in (c or "").lower())
+                        or card.find("h2")
+                    )
+                    company_el = (
+                        card.find("a", class_="css-17s97q8")
+                        or card.find("a", class_=lambda c: "company" in (c or "").lower())
+                        or card.find("span", class_=lambda c: "company" in (c or "").lower())
+                    )
+                    loc_el = (
+                        card.find("span", class_="css-5wys0k")
+                        or card.find("span", class_=lambda c: "location" in (c or "").lower())
+                    )
+                    link_el = title_el.find("a", href=True) if title_el else None
 
-                    title   = title_el.get_text(strip=True)   if title_el   else ""
-                    company = company_el.get_text(strip=True) if company_el else ""
-                    location = loc_el.get_text(strip=True)   if loc_el     else "Egypt"
-                    link    = f"https://wuzzuf.net{link_el['href']}" if link_el else url
+                    title    = title_el.get_text(strip=True)   if title_el   else ""
+                    company  = company_el.get_text(strip=True) if company_el else ""
+                    location = loc_el.get_text(strip=True)     if loc_el     else "Egypt"
+                    link     = f"https://wuzzuf.net{link_el['href']}" if link_el else url
 
-                    if not is_relevant(title):
+                    if not title or not is_relevant(title):
                         continue
 
-                    job = {
+                    jobs.append({
                         "id":       make_job_id(title, company, link),
                         "title":    title,
                         "company":  company,
                         "location": location,
                         "url":      link,
                         "source":   "Wuzzuf.net",
-                    }
-                    jobs.append(job)
-                    log.info(f"  ✅ لقينا: {title} @ {company} - {location}")
+                    })
+                    log.info(f"  ✅ {title} @ {company} - {location}")
                 except Exception:
                     continue
 
-            time.sleep(2)
+            time.sleep(random.uniform(1, 3))
         except Exception as e:
             log.warning(f"Wuzzuf error for '{term}': {e}")
 
@@ -205,7 +300,9 @@ def scrape_gulfjobs() -> list:
 
     try:
         url = "https://www.gulfjobs.com/search-jobs/results/?keywords=planetarium&location=0"
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = safe_request(url)
+        if not resp:
+            return jobs
         soup = BeautifulSoup(resp.text, "html.parser")
 
         cards = soup.find_all("div", class_="job-listing")
@@ -216,28 +313,27 @@ def scrape_gulfjobs() -> list:
                 loc_el     = card.find("span", class_="location")
                 link_el    = card.find("a", href=True)
 
-                title   = title_el.get_text(strip=True)   if title_el   else ""
-                company = company_el.get_text(strip=True) if company_el else ""
-                location = loc_el.get_text(strip=True)   if loc_el     else ""
-                link    = link_el["href"]                 if link_el    else url
+                title    = title_el.get_text(strip=True)   if title_el   else ""
+                company  = company_el.get_text(strip=True) if company_el else ""
+                location = loc_el.get_text(strip=True)     if loc_el     else ""
+                link     = link_el["href"]                 if link_el    else url
 
                 if not is_relevant(title):
                     continue
 
-                job = {
+                jobs.append({
                     "id":       make_job_id(title, company, link),
                     "title":    title,
                     "company":  company,
                     "location": location,
                     "url":      link,
                     "source":   "GulfJobs.com",
-                }
-                jobs.append(job)
-                log.info(f"  ✅ لقينا: {title} @ {company} - {location}")
+                })
+                log.info(f"  ✅ {title} @ {company} - {location}")
             except Exception:
                 continue
 
-        time.sleep(2)
+        time.sleep(random.uniform(1, 3))
     except Exception as e:
         log.warning(f"GulfJobs error: {e}")
 
@@ -245,7 +341,7 @@ def scrape_gulfjobs() -> list:
 
 
 # ─────────────────────────────────────────────
-# 5. LINKEDIN (عبر RSS/Search)
+# 5. LINKEDIN — مع fallback selectors + 7 أيام
 # ─────────────────────────────────────────────
 def scrape_linkedin() -> list:
     jobs = []
@@ -253,11 +349,11 @@ def scrape_linkedin() -> list:
 
     keywords = ["planetarium operator", "dome operator", "قبة فلكية"]
     geo_ids = {
-        "SA": "101452733",  # Saudi Arabia
-        "AE": "101282714",  # UAE
-        "EG": "106556571",  # Egypt
-        "KW": "100635387",  # Kuwait
-        "QA": "97785592",   # Qatar
+        "SA": "101452733",
+        "AE": "101282714",
+        "EG": "106556571",
+        "KW": "100635387",
+        "QA": "97785592",
     }
 
     for keyword in keywords:
@@ -266,41 +362,62 @@ def scrape_linkedin() -> list:
                 encoded = urllib.parse.quote(keyword)
                 url = (
                     f"https://www.linkedin.com/jobs/search/?keywords={encoded}"
-                    f"&geoId={geo_id}&f_TPR=r86400"  # آخر 24 ساعة
+                    f"&geoId={geo_id}&f_TPR=r604800"  # آخر 7 أيام (كان 24 ساعة — أشمل)
                 )
-                resp = requests.get(url, headers=HEADERS, timeout=15)
+                resp = safe_request(url)
+                if not resp:
+                    time.sleep(random.uniform(3, 6))
+                    continue
                 soup = BeautifulSoup(resp.text, "html.parser")
 
-                cards = soup.find_all("div", class_="base-card")
+                # Fallback selectors
+                cards = (
+                    soup.find_all("div", class_="base-card")
+                    or soup.find_all("div", class_=lambda c: c and "job-search-card" in (c or ""))
+                    or soup.find_all("li", class_=lambda c: c and "result" in (c or "").lower())
+                )
+
                 for card in cards:
                     try:
-                        title_el   = card.find("h3", class_="base-search-card__title")
-                        company_el = card.find("h4", class_="base-search-card__subtitle")
-                        loc_el     = card.find("span", class_="job-search-card__location")
-                        link_el    = card.find("a", class_="base-card__full-link")
+                        title_el = (
+                            card.find("h3", class_="base-search-card__title")
+                            or card.find("h3", class_=lambda c: "title" in (c or "").lower())
+                            or card.find("h3")
+                        )
+                        company_el = (
+                            card.find("h4", class_="base-search-card__subtitle")
+                            or card.find("h4", class_=lambda c: "subtitle" in (c or "").lower())
+                        )
+                        loc_el = (
+                            card.find("span", class_="job-search-card__location")
+                            or card.find("span", class_=lambda c: "location" in (c or "").lower())
+                        )
+                        link_el = (
+                            card.find("a", class_="base-card__full-link")
+                            or card.find("a", href=True)
+                        )
 
-                        title   = title_el.get_text(strip=True)   if title_el   else ""
-                        company = company_el.get_text(strip=True) if company_el else ""
-                        location = loc_el.get_text(strip=True)   if loc_el     else ""
-                        link    = link_el["href"]                 if link_el    else url
+                        title    = title_el.get_text(strip=True)   if title_el   else ""
+                        company  = company_el.get_text(strip=True) if company_el else ""
+                        location = loc_el.get_text(strip=True)     if loc_el     else ""
+                        link     = link_el["href"]                 if link_el    else url
 
-                        if not is_relevant(title):
+                        if not title or not is_relevant(title):
                             continue
 
-                        job = {
+                        jobs.append({
                             "id":       make_job_id(title, company, link),
                             "title":    title,
                             "company":  company,
                             "location": location,
                             "url":      link,
                             "source":   "LinkedIn",
-                        }
-                        jobs.append(job)
-                        log.info(f"  ✅ لقينا: {title} @ {company} - {location}")
+                        })
+                        log.info(f"  ✅ {title} @ {company} - {location}")
                     except Exception:
                         continue
 
-                time.sleep(2)
+                time.sleep(random.uniform(3, 6))  # LinkedIn حساس جداً للسرعة
             except Exception as e:
                 log.warning(f"LinkedIn error for '{keyword}' in {country}: {e}")
 
@@ -308,89 +425,100 @@ def scrape_linkedin() -> list:
 
 
 # ─────────────────────────────────────────────
-# 6. INDEED (دول عربية)
+# 6. INDEED HTML (fallback إضافي للـ RSS)
 # ─────────────────────────────────────────────
-def scrape_indeed() -> list:
+def scrape_indeed_html() -> list:
     jobs = []
-    log.info("🔍 بيسكان Indeed...")
+    log.info("🔍 بيسكان Indeed (HTML fallback)...")
 
     indeed_domains = [
         ("https://sa.indeed.com", "Saudi Arabia"),
         ("https://ae.indeed.com", "UAE"),
         ("https://eg.indeed.com", "Egypt"),
-        ("https://kw.indeed.com", "Kuwait"),
-        ("https://qa.indeed.com", "Qatar"),
     ]
 
     for domain, country in indeed_domains:
         for term in ["planetarium", "dome operator"]:
             try:
                 encoded = urllib.parse.quote(term)
-                url = f"{domain}/jobs?q={encoded}"
-                resp = requests.get(url, headers=HEADERS, timeout=15)
+                url = f"{domain}/jobs?q={encoded}&sort=date"
+                resp = safe_request(url)
+                if not resp:
+                    continue
                 soup = BeautifulSoup(resp.text, "html.parser")
 
-                cards = soup.find_all("div", class_="job_seen_beacon")
+                cards = (
+                    soup.find_all("div", class_="job_seen_beacon")
+                    or soup.find_all("div", attrs={"data-testid": "slider_item"})
+                    or soup.find_all("li", class_=lambda c: c and "result" in (c or "").lower())
+                )
+
                 for card in cards:
                     try:
-                        title_el   = card.find("h2", class_="jobTitle")
-                        company_el = card.find("span", class_="companyName")
-                        loc_el     = card.find("div",  class_="companyLocation")
-                        link_el    = title_el.find("a", href=True) if title_el else None
+                        title_el = card.find("h2", class_="jobTitle") or card.find("h2")
+                        company_el = (
+                            card.find("span", class_="companyName")
+                            or card.find("span", attrs={"data-testid": "company-name"})
+                        )
+                        loc_el = (
+                            card.find("div", class_="companyLocation")
+                            or card.find("div", attrs={"data-testid": "text-location"})
+                        )
+                        link_el = title_el.find("a", href=True) if title_el else None
 
-                        title   = title_el.get_text(strip=True)   if title_el   else ""
-                        company = company_el.get_text(strip=True) if company_el else ""
-                        location = loc_el.get_text(strip=True)   if loc_el     else country
-                        link    = f"{domain}{link_el['href']}"   if link_el    else url
+                        title    = title_el.get_text(strip=True)   if title_el   else ""
+                        company  = company_el.get_text(strip=True) if company_el else ""
+                        location = loc_el.get_text(strip=True)     if loc_el     else country
+                        link     = f"{domain}{link_el['href']}"    if link_el    else url
 
-                        if not is_relevant(title):
+                        if not title or not is_relevant(title):
                             continue
 
-                        job = {
+                        jobs.append({
                             "id":       make_job_id(title, company, link),
                             "title":    title,
                             "company":  company,
                             "location": location,
                             "url":      link,
                             "source":   f"Indeed ({country})",
-                        }
-                        jobs.append(job)
-                        log.info(f"  ✅ لقينا: {title} @ {company} - {location}")
+                        })
+                        log.info(f"  ✅ {title} @ {company} - {location}")
                     except Exception:
                         continue
 
-                time.sleep(2)
+                time.sleep(random.uniform(2, 4))
             except Exception as e:
-                log.warning(f"Indeed error for '{term}' in {country}: {e}")
+                log.warning(f"Indeed HTML error for '{term}' in {country}: {e}")
 
     return jobs
 
 
 # ─────────────────────────────────────────────
-# الدالة الرئيسية - بتجمع من كل المواقع
+# الدالة الرئيسية — بتجمع من كل المواقع
 # ─────────────────────────────────────────────
 def get_all_jobs() -> list:
     """بيجيب كل الشغلانات من كل المواقع"""
     all_jobs = []
 
     scrapers = [
-        scrape_google_jobs,
+        scrape_indeed_rss,    # الأكثر ثبات — RSS مباشر
         scrape_bayt,
         scrape_wuzzuf,
         scrape_gulfjobs,
         scrape_linkedin,
-        scrape_indeed,
+        scrape_indeed_html,   # HTML fallback
     ]
 
     for scraper in scrapers:
         try:
             found = scraper()
             all_jobs.extend(found)
+            log.info(f"  📦 {scraper.__name__}: وجدنا {len(found)} شغلانة")
         except Exception as e:
             log.error(f"خطأ في {scraper.__name__}: {e}")
 
     # إزالة التكرار بالـ ID
-    seen_ids = set()
+    seen_ids    = set()
     unique_jobs = []
     for job in all_jobs:
         if job["id"] not in seen_ids:
